@@ -1,0 +1,565 @@
+create or replace FUNCTION wftbr_mns_sr_pim_testandturnup ( 
+    i_attemptaskdataid   IN NUMBER,
+    i_messagetype        IN NUMBER
+) RETURN VARCHAR2 IS
+
+    o_reason                  VARCHAR2(2000);
+
+   -- local declarations
+    l_procname                VARCHAR2(75);
+    sql_count                 INTEGER;
+    ttd_rec                   at_temp_task_data%rowtype;
+    l_create_sr_retcode       INTEGER;
+    l_completetask_retcode    INTEGER;
+    l_objectid                NUMBER;
+    o_err_msg                 VARCHAR2(200);
+    return_state              BOOLEAN;
+    l_slave_atstartdate       at_wfm_task.atstartdate%TYPE;
+    l_atwfmprojectid          at_wfm_task.atwfmprojectid%TYPE;
+    l_slave_atprojecttaskid   at_wfm_task.atprojecttaskid%TYPE;
+    l_sr_siteid               sw_service_order.swsiteid%TYPE;
+    data_found                BOOLEAN;
+    l_api_return_code         NUMBER;
+    install_type              VARCHAR2(100);
+   -- circuit fields
+    l_atcircuitname           at_circuit_base.atcircuitname%TYPE;
+
+   -- asset fields
+    l_asset_swinstprodid      sw_inst_product.swinstprodid%TYPE;
+    assetcount                INT;
+    temp_msg                  VARCHAR2(400);
+    assetaliasname            sw_inst_product.atassetaliasname%TYPE;
+
+   -- vars required to call func to create SRs
+    answer                    NUMBER;
+    return_code               INTEGER;
+    refusalreason             VARCHAR2(2000);
+    errortext                 VARCHAR2(2000);
+
+   -- vars for audit trail
+    l_old_value               VARCHAR2(250);
+    fatal EXCEPTION;
+
+   -- Initialising cursor to check asset(s) with diff site and not in Installed state
+    CURSOR c_get_asset_recs (
+        p_swinstprodid NUMBER,
+        p_swsiteid NUMBER
+    ) IS
+   -- get the node primary information
+     SELECT
+             sw_inst_product.swstatus,
+             sw_inst_product.atspecassetname,
+             DECODE(nvl(sw_inst_product.atassetprimaryflag,0),1,'Primary',0,'Secondary') decodeprimaryflag,
+             sw_site.swsitename
+         FROM
+             sw_inst_product,
+             sw_site
+         WHERE
+             sw_inst_product.swinstprodid = p_swinstprodid
+             AND sw_inst_product.atassetprimaryflag = 1
+             AND sw_inst_product.swsiteid = sw_site.swsiteid
+             AND ( sw_inst_product.swstatus NOT IN (
+                 'Deleted',
+                 'Installed'
+             )
+                   OR sw_inst_product.swsiteid <> p_swsiteid )
+         UNION
+   -- get the node secondaries
+         SELECT
+             sw_inst_product.swstatus,
+             sw_inst_product.atspecassetname,
+             DECODE(nvl(sw_inst_product.atassetprimaryflag,0),1,'Primary',0,'Secondary') decodeprimaryflag,
+             sw_site.swsitename
+         FROM
+             sw_inst_product,
+             sw_site
+         WHERE
+             sw_inst_product.atnodeprimaryid = p_swinstprodid
+             AND nvl(sw_inst_product.atassetprimaryflag,0) = 0
+             AND sw_inst_product.swsiteid = sw_site.swsiteid
+             AND ( sw_inst_product.swstatus NOT IN (
+                 'Deleted',
+                 'Installed'
+             )
+                   OR sw_inst_product.swsiteid <> p_swsiteid );
+
+    PROCEDURE init_sr IS
+    BEGIN
+        BEGIN
+                  -- read AT_TEMP_TASK_DATA Row
+            SELECT
+                *
+            INTO ttd_rec
+            FROM
+                at_temp_task_data
+            WHERE
+                at_temp_task_data.attemptaskdataid = i_attemptaskdataid;
+
+        EXCEPTION
+            WHEN no_data_found THEN
+                ROLLBACK;
+                logerror(l_procname,1,sqlcode,sqlcode,'ATTEMPTASKDATAID:'
+                                                        || i_attemptaskdataid
+                                                        || ' NOT FOUND');
+
+                RAISE fatal;
+        END;
+
+        BEGIN
+                   -- get Service Order objectid
+            SELECT
+                at_wfm_project.atentryobjectid
+            INTO l_objectid
+            FROM
+                at_wfm_task,
+                at_wfm_project
+            WHERE
+                ttd_rec.at_projtaskid = at_wfm_task.atprojecttaskid
+                AND at_wfm_task.atwfmprojectid = at_wfm_project.atwfmprojectid
+                AND at_wfm_project.atentryobjecttype = 'SERVICE_ORDER';
+
+        EXCEPTION
+            WHEN no_data_found THEN
+                ROLLBACK;
+                logerror(l_procname,1,sqlcode,sqlcode,'PROJTASKID: '
+                                                        || ttd_rec.at_projtaskid
+                                                        || '. SRID# (OBJECTID) NOT FOUND');
+
+                RAISE fatal;
+        END;
+
+    END;
+
+BEGIN
+   -- init vars
+    o_err_msg := NULL;
+    o_reason := NULL;
+    l_procname := 'WFTBR_MNS_SR_PIM_TESTANDTURNUP';
+
+    return_state := true;
+
+   -----------------------------------------------------------------------------
+   -- handle messages for this task
+   -- default is to return true
+   -----------------------------------------------------------------------------
+    IF i_messagetype = 1 THEN --TASK_OPEN_MESSAGE
+        return_state := true;
+    ELSIF i_messagetype = 2 THEN -- WFDOC_MESSAGE_TYPE: TASK_COMPLETE_REQUEST_MESSAGE
+        init_sr;
+        BEGIN
+            SELECT
+                nvl(attextvalue,'Professional install')
+            INTO install_type
+            FROM
+                at_attribute_values
+            WHERE
+                swobjecttype = 'SERVICE ORDER LINE'
+                AND swobjectid = (
+                    SELECT
+                        *
+                    FROM
+                        (
+                            SELECT
+                                atserviceordlnid
+                            FROM
+                                at_service_ord_ln
+                            WHERE
+                                atserviceorderid = l_objectid
+                                AND atstatus <> 'Cancelled'
+                            ORDER BY
+                                atserviceordlnid
+                        )
+                    WHERE
+                        ROWNUM = 1
+                )
+                AND atattributesid = (
+                    SELECT
+                        atattributesid
+                    FROM
+                        at_attributes
+                    WHERE
+                        atattributecode = (
+                            SELECT
+                                atbusruleattr
+                            FROM
+                                at_wfm_catalog_automation
+                            WHERE
+                                atmessageproc = l_procname
+                        )
+                );
+
+
+                end;
+                IF ( install_type = 'Professional install' ) THEN
+                    o_err_msg := 'get site associated with SR';
+                    SELECT
+                        sw_service_order.swsiteid
+                    INTO l_sr_siteid
+                    FROM
+                        sw_service_order
+                    WHERE
+                        sw_service_order.swserviceorderid = l_objectid;
+
+                    o_err_msg := 'get asset alias name and asset id';
+                    BEGIN
+                        SELECT
+                            sw_inst_product.swinstprodid,
+                            sw_inst_product.atassetaliasname
+                        INTO
+                            l_asset_swinstprodid,
+                            assetaliasname
+                        FROM
+                            sw_inst_product,
+                            sw_service_order
+                        WHERE
+                            sw_service_order.swserviceorderid = l_objectid
+                            AND sw_service_order.swinstprodid = sw_inst_product.swinstprodid
+                            AND sw_inst_product.atassetprimaryflag = 1;
+
+                    EXCEPTION
+                        WHEN no_data_found THEN
+                            l_asset_swinstprodid := NULL;
+                            assetaliasname := NULL;
+                    END;
+
+                    return_state := true;
+              -- WFDOC_BR_LOGIC: task complete Requested Completion / missed Requested Compl reason logic
+                    IF return_state = true THEN
+                        wf_taskcomp_reqcomp_edit(ttd_rec,l_objectid,return_state,o_reason);
+                    END IF;
+              -- WFDOC_BR_LOGIC: task complete Standard Interval / missed SI reason logic
+
+                    IF return_state = true THEN
+                        wf_taskcomp_si_edit(ttd_rec,l_objectid,return_state,o_reason);
+                    END IF;
+               -- WFDOC_BR_LOGIC: task complete / SLA(swpromisedate) / missed SLA reason logic
+
+                    IF return_state = true THEN
+                        wf_taskcomp_sla_edit(ttd_rec,l_objectid,return_state,o_reason);
+                    END IF;
+
+              -- WFDOC_BR_LOGIC: ensure that at least one service order line exists
+
+                    IF return_state = true THEN
+                        o_err_msg := 'get at_service_ord_ln count';
+                        SELECT
+                            COUNT(*)
+                        INTO sql_count
+                        FROM
+                            at_service_ord_ln
+                        WHERE
+                            at_service_ord_ln.atstatus <> 'Deleted'
+                            AND at_service_ord_ln.atserviceorderid = l_objectid;
+
+                        IF sql_count = 0 THEN
+                            return_state := false;
+                            o_reason := 'There are no Service Order Lines Associated with this Service Request.';
+                        END IF;
+                    END IF;
+
+              -- WFDOC_BR_LOGIC: ensure that SR node primary name is populated and non-numeric
+
+                    IF return_state = true THEN
+                        wftbr_common_pkg.verify_only_sr_node_primary_nm(l_objectid,return_state,o_reason);
+                    END IF;
+
+              -- WFDOC_BR_LOGIC:  "Asset Alias Name" on the primary asset must be populated
+
+                    IF return_state = true THEN
+                        o_err_msg := 'get asset alias name';
+                        IF assetaliasname IS NULL THEN
+                            o_reason := 'There is no Asset Alias Name on the primary asset';
+                            return_state := false;
+                        END IF;
+                    END IF;
+
+
+              -- DTAC-IC and PIM are exempt from the rule.
+              -- fail if primary and secondary assets have locs that do not match
+              --         the SR siteid, or if their status is not 'Installed' (ignore Deleted).
+
+                    IF return_state = true THEN
+                 -- WFDOC_BR_LOGIC: fail if primary and secondary assets have locs that do not match SR siteid, or if status is not 'Installed' (ignore Deleted).
+
+
+
+
+
+                            assetcount := 0;
+                            FOR asset_rec IN c_get_asset_recs(l_asset_swinstprodid,l_sr_siteid) LOOP
+                                assetcount := assetcount + 1;
+                                IF assetcount = 1 THEN
+                                    temp_msg := ' Asset(s) are NOT in a Final State, or do match the Service Request Site. This Impacts Billing and Management. First ('
+                                                || asset_rec.decodeprimaryflag
+                                                || ') Asset is: '
+                                                || asset_rec.atspecassetname
+                                                || ', Status: '
+                                                || asset_rec.swstatus
+                                                || ', Site: '
+                                                || asset_rec.swsitename
+                                                || '.';
+
+                                END IF;
+
+                            END LOOP;
+
+                            IF assetcount > 0 THEN
+                                o_reason := 'Asset count : '
+                                            || assetcount
+                                            || 'Error : '
+                                            || temp_msg;
+                                return_state := false;
+                            END IF;
+
+
+
+                    END IF;
+
+                END IF;
+
+
+    ELSIF i_messagetype = 3 THEN -- WFDOC_MESSAGE_TYPE: TASK_COMPLETE_MESSAGE
+        init_sr;
+
+        -- WFDOC_BR_LOGIC: complete_sr() update swstatus to cleared, sr lines to completed
+        SAVEPOINT update_sr_status;
+        o_err_msg := 'update SR status';
+        wftbr_common_pkg.complete_sr(l_objectid,ttd_rec,return_code,errortext);
+        IF return_code <> 0 THEN
+            ROLLBACK TO SAVEPOINT update_sr_status;
+            wftbr_common_pkg.log_error(l_procname,1,return_code,sqlcode,' wftbr_common_pkg.complete_sr FAILED for SR '
+                                                                          || l_objectid
+                                                                          || ': '
+                                                                          || errortext);
+
+        ELSE
+            COMMIT;
+        END IF;
+
+        -- update metrics (FUTURE)
+        -- return success, even if an error is encountered
+
+        return_state := true;
+    ELSIF i_messagetype = 4 THEN
+        return_state := true;
+    ELSIF i_messagetype = 5 THEN --TASK_UNCOMPLETED_MESSAGE
+        o_reason := 'This task cannot be uncompleted.';
+        return_state := FALSE;
+    ELSIF i_messagetype = 6 THEN --TASK_UNEXPAND_REQUEST_MESSAGE
+        return_state := true;
+    ELSIF i_messagetype = 7 THEN --TASK_UNEXPANDED_MESSAGE
+        return_state := true;
+    ELSIF i_messagetype = 8 THEN --TASK_EXPANDED_MESSAGE
+        return_state := true;
+    ELSIF i_messagetype = 9 THEN --TASK_UNOPENED_MESSAGE
+        return_state := true;
+    ELSIF i_messagetype = 10 THEN --TASK_LATE_STARTING_MESSAGE
+        return_state := true;
+    ELSIF i_messagetype = 11 THEN --TASK_WAITING_STARTING_MESSAGE
+        return_state := true;
+    ELSIF i_messagetype = 12 THEN --TASK_NA_REQUEST_MESSAGE
+        return_state := true;
+    ELSIF i_messagetype = 13 THEN --TASK_NA_MESSAGE
+        return_state := true;
+    ELSIF i_messagetype = 14 THEN --TASK_APPLICABLE_MESSAGE
+        return_state := true;
+    ELSIF i_messagetype = 15 THEN --TASK_DUE_MESSAGE
+        return_state := true;
+    ELSIF i_messagetype = 16 THEN --TASK_CREATED_MESSAGE
+        return_state := true;
+    ELSIF i_messagetype = 17 THEN -- WFDOC_MESSAGE_TYPE: TASK_DATA_CHANGED_MESSAGE
+        return_state := true;
+    ELSIF i_messagetype = 18 THEN --TASK_ASSIGNMENTS_CHANGED_MESSAGE
+        return_state := true;
+    ELSIF i_messagetype = 19 THEN --TASK_DESTROYED_MESSAGE
+        return_state := true;
+    ELSIF i_messagetype = 20 THEN --TASK_EXPAND_REQUEST_MESSAGE
+        return_state := true;
+    ELSIF i_messagetype = 21 THEN --TASK_ASSIGNMENT_REQUEST_MESSAGE
+        return_state := true;
+    ELSIF i_messagetype = 22 THEN --TASK_DUE_DATE_CHNG_REQUEST_MESSAGE
+        return_state := true;
+    ELSIF i_messagetype = 23 THEN --TASK_INTERVAL_CHNG_REQUEST_MESSAGE
+        return_state := true;
+    ELSIF i_messagetype = 24 THEN --TASK_START_DATE_CHNG_REQUEST_MESSAGE
+        init_SR;
+        if ttd_rec.AT_SCHEDSTARTDATE is not null then
+        select at_wfm_task.ATWFMPROJECTID
+         into l_ATWFMPROJECTID
+         from at_wfm_task
+         where ttd_rec.AT_PROJTASKID = at_wfm_task.ATPROJECTTASKID;
+         data_found := TRUE;
+             l_SLAVE_ATSTARTDATE := NULL;
+             l_SLAVE_ATPROJECTTASKID := NULL;
+
+             BEGIN
+             o_err_msg := NULL;
+             select at_wfm_task.ATSTARTDATE, at_wfm_task.ATPROJECTTASKID
+                   into l_SLAVE_ATSTARTDATE, l_SLAVE_ATPROJECTTASKID
+             from at_wfm_task, at_wfm_task_catalog
+             where
+                     at_wfm_task.ATWFMPROJECTID = l_ATWFMPROJECTID
+                     and at_wfm_task.ATSTATUSCODE in ('OPEN', 'PENDING')
+                     and at_wfm_task.ATWFMTASKCATALOGID = at_wfm_task_catalog.ATWFMTASKCATALOGID
+                     and at_wfm_task_catalog.ATTASKCODE = 'MNS_SR_IC_VERIFY_CIRCUITS'
+                     and rownum = 1;
+             EXCEPTION
+             WHEN NO_DATA_FOUND THEN
+                          data_found := FALSE;
+             END;
+
+             if data_found = TRUE then
+                  -- compare dates, round to nearest hour
+                  if l_SLAVE_ATSTARTDATE is null or
+                     (round(ttd_rec.AT_SCHEDSTARTDATE, 'HH24') <> (round(l_SLAVE_ATSTARTDATE, 'HH24') + 7)) then
+                 -- call API to set sync scheduled start date in MNS_SR_IC_VERIFY_CIRCUITS
+                   o_err_msg := 'calling WFTBR_COMMON_PKG.setSchedStartDateWrapper()';
+                   l_api_return_code := WFTBR_COMMON_PKG.setSchedStartDateWrapper(
+                              l_SLAVE_ATPROJECTTASKID,            -- MNS_SR_SV_INSTALL_EQUIP task
+                      ttd_rec.AT_SCHEDSTARTDATE - 7,  -- use Test and Turnup Date minus seven
+                      NULL,                           -- internal time no need to derive time zone
+                        'Synchronize Scheduled Start Date to MNS_SR_TEST_AND_TURNUP - 7 Days',
+                        answer,
+                        RefusalReason,
+                        ErrorText);
+                   IF l_api_return_code <> 0 THEN
+                        -- error
+                        wftbr_common_pkg.LOG_ERROR(l_procname, 1, l_api_return_code, NULL, 'WFTBR_COMMON_PKG.setSchedStartDateWrapper FAILED');
+                   ELSIF answer = 0 THEN
+                      -- "is it OK to complete?" = 0 means error
+                        wftbr_common_pkg.LOG_ERROR(l_procname, 1, -1, NULL, 'WFTBR_COMMON_PKG.setSchedStartDateWrapper: Refused:' || RefusalReason);
+                   ELSE
+                      -- successful completion of api wrapper
+                        return_state := TRUE; -- stub
+                   END IF;
+
+                  end if;
+             end if;
+
+             -- WFDOC_BR_LOGIC: ensure that date is sychronized with the MNS_SR_DTAC_PRETEST task (slave) set slave scheduled start date to ttd - 7
+             data_found := TRUE;
+             l_SLAVE_ATSTARTDATE := NULL;
+             l_SLAVE_ATPROJECTTASKID := NULL;
+
+             BEGIN
+             o_err_msg := NULL;
+             select at_wfm_task.ATSTARTDATE, at_wfm_task.ATPROJECTTASKID
+                   into l_SLAVE_ATSTARTDATE, l_SLAVE_ATPROJECTTASKID
+             from at_wfm_task, at_wfm_task_catalog
+             where
+                     at_wfm_task.ATWFMPROJECTID = l_ATWFMPROJECTID
+                     and at_wfm_task.ATSTATUSCODE in ('OPEN', 'PENDING')
+                     and at_wfm_task.ATWFMTASKCATALOGID = at_wfm_task_catalog.ATWFMTASKCATALOGID
+                     and at_wfm_task_catalog.ATTASKCODE = 'MNS_SR_DTAC_PRETEST'
+                     and rownum = 1;
+             EXCEPTION
+             WHEN NO_DATA_FOUND THEN
+                          data_found := FALSE;
+             END;
+
+             if data_found = TRUE then
+                  -- compare dates, round to nearest hour
+                  if l_SLAVE_ATSTARTDATE is null or
+                     (round(ttd_rec.AT_SCHEDSTARTDATE, 'HH24') <> (round(l_SLAVE_ATSTARTDATE, 'HH24') + 7)) then
+                 -- call API to set sync scheduled start date in MNS_SR_IC_VERIFY_CIRCUITS
+                   o_err_msg := 'calling WFTBR_COMMON_PKG.setSchedStartDateWrapper()';
+                   l_api_return_code := WFTBR_COMMON_PKG.setSchedStartDateWrapper(
+                              l_SLAVE_ATPROJECTTASKID,            -- SLAVE task
+                      ttd_rec.AT_SCHEDSTARTDATE - 7,  -- use Test and Turnup Date minus seven
+                      NULL,                           -- internal time no need to derive time zone
+                        'Synchronize Scheduled Start Date to MNS_SR_TEST_AND_TURNUP - 7 Days',
+                        answer,
+                        RefusalReason,
+                        ErrorText);
+                   IF l_api_return_code <> 0 THEN
+                        -- error
+                        wftbr_common_pkg.LOG_ERROR(l_procname, 1, l_api_return_code, NULL, 'WFTBR_COMMON_PKG.setSchedStartDateWrapper FAILED');
+                   ELSIF answer = 0 THEN
+                      -- "is it OK to complete?" = 0 means error
+                        wftbr_common_pkg.LOG_ERROR(l_procname, 1, -1, NULL, 'WFTBR_COMMON_PKG.setSchedStartDateWrapper: Refused:' || RefusalReason);
+                   ELSE
+                      -- successful completion of api wrapper
+                        return_state := TRUE; -- stub
+                   END IF;
+
+                  end if;
+             end if;
+
+             -- WFDOC_BR_LOGIC: ensure that date is synchronized with the MNS_SR_PIM_CONFIRM_INSTALL task
+             -- 18.1 GPS Sytem Improvements (Enhancements) Project: #1 - Unnecessary NCR Resched Charges
+
+             data_found := TRUE;
+             BEGIN
+             o_err_msg := NULL;
+             select at_wfm_task.ATSTARTDATE, at_wfm_task.ATPROJECTTASKID
+                   into l_SLAVE_ATSTARTDATE, l_SLAVE_ATPROJECTTASKID
+             from at_wfm_task, at_wfm_task_catalog
+             where
+                     at_wfm_task.ATWFMPROJECTID = l_ATWFMPROJECTID
+                     and at_wfm_task.ATSTATUSCODE in ('PENDING', 'WAITING')
+                       and at_wfm_task.ATNOTAPPLICABLE = 0
+                     and at_wfm_task.ATWFMTASKCATALOGID = at_wfm_task_catalog.ATWFMTASKCATALOGID
+                     and at_wfm_task_catalog.ATTASKCODE = 'MNS_SR_PIM_CONFIRM_INSTALL'
+                     and rownum = 1;
+             EXCEPTION
+             WHEN NO_DATA_FOUND THEN
+                          data_found := FALSE;
+             END;
+
+             if data_found = TRUE then
+                  -- compare dates, round to nearest hour
+                  if l_SLAVE_ATSTARTDATE is null or
+                     (round(ttd_rec.AT_SCHEDSTARTDATE, 'HH24') <> (round(l_SLAVE_ATSTARTDATE, 'HH24') + 15)) then
+                 -- call API to set sync scheduled start date
+                      o_err_msg := 'calling WFTBR_COMMON_PKG.setSchedStartDateWrapper()';
+                      l_api_return_code := WFTBR_COMMON_PKG.setSchedStartDateWrapper(
+                            l_SLAVE_ATPROJECTTASKID,               -- SLAVE task
+                      ttd_rec.AT_SCHEDSTARTDATE - 15,  -- use Test and Turnup Date minus 15 days
+                      NULL,                            -- internal time no need to derive time zone
+                        'Synchronize Scheduled Start Date to MNS_SR_TEST_AND_TURNUP - 15 Days',
+                        answer,
+                        RefusalReason,
+                        ErrorText);
+                   IF l_api_return_code <> 0 THEN
+                        -- error
+                        LOGERROR(l_procname, 1, l_api_return_code, NULL, 'WFTBR_COMMON_PKG.setSchedStartDateWrapper FAILED');
+                   ELSIF answer = 0 THEN
+                      -- "is it OK to complete?" = 0 means error
+                        LOGERROR(l_procname, 1, -1, NULL, 'WFTBR_COMMON_PKG.setSchedStartDateWrapper: Refused:' || RefusalReason);
+                   ELSE
+                      -- successful completion of api wrapper
+                        return_state := TRUE; -- stub
+                   END IF;
+
+                  end if;
+             end if;
+
+        end if;  -- match for if ttd_rec.AT_SCHEDSTARTDATE is not null
+
+        return_state := TRUE;
+    ELSIF i_messagetype = 25 THEN --TASK_APPLICABLE_REQUEST_MESSAGE
+        return_state := true;
+    ELSE
+        return_state := true;
+    END IF;
+
+    IF return_state = true THEN
+      -- null return indicates success
+        o_reason := NULL;
+    END IF;
+    RETURN o_reason;
+
+
+-------------------------------------------------------------------
+-- on error return (o_reason is set to null, for "true")
+-------------------------------------------------------------------
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        logerror(l_procname,1,sqlcode,sqlcode,'SR: '
+                                                || l_objectid
+                                                || '; EXCEPTION HANDLER:'
+                                                || o_err_msg);
+
+        RETURN o_reason;
+END;
